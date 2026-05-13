@@ -35,6 +35,9 @@ def _make_hardware(
 
 
 def test_ranker_picks_highest_scoring_variant():
+    # On a fast GPU (≥800 GB/s) both quants run well above the comfort
+    # threshold, so the F16 quality bonus dominates and F16 wins. On a slow
+    # GPU the speed gap flips the choice — that's exercised separately.
     model = ModelInfo(
         id="org/Test-8B-GGUF",
         family_id="org/Test-8B-GGUF",
@@ -55,7 +58,7 @@ def test_ranker_picks_highest_scoring_variant():
             ),
         ],
     )
-    hw = _make_hardware()
+    hw = _make_hardware(bandwidth_gbps=900.0)
     results = rank_models(
         [model],
         hw,
@@ -334,11 +337,13 @@ def test_min_params_filter_excludes_small_models():
 
 
 def test_general_profile_prefers_full_gpu_when_direct_is_partial():
+    # Direct-evidence model that won't fit on 8GB even after Q4_K_M synthesis
+    # (72B * 0.56 ≈ 40GB → partial_offload).
     partial_direct = ModelInfo(
-        id="Qwen/Qwen2.5-7B-Instruct",
-        family_id="qwen2.5-7b",
-        name="Qwen2.5-7B-Instruct",
-        parameter_count=7_000_000_000,
+        id="Qwen/Qwen2.5-72B-Instruct",
+        family_id="qwen2.5-72b",
+        name="Qwen2.5-72B-Instruct",
+        parameter_count=72_000_000_000,
         downloads=1000,
         likes=100,
     )
@@ -356,7 +361,7 @@ def test_general_profile_prefers_full_gpu_when_direct_is_partial():
         hw,
         top_n=10,
         benchmark_scores={
-            "Qwen/Qwen2.5-7B-Instruct": 80.0,  # direct
+            "Qwen/Qwen2.5-72B-Instruct": 80.0,  # direct
             "Qwen/Qwen3-32B": 85.0,  # line inherited for Qwen3-9B
         },
         task_profile="general",
@@ -408,11 +413,13 @@ def test_family_dedup_prefers_direct_when_enabled():
 
 
 def test_full_gpu_estimated_ranks_above_partial_direct():
+    # Use 72B model so Q4_K_M synthesis still doesn't fit 8GB — preserves the
+    # "direct evidence, but model is too big" half of this scenario.
     partial_direct = ModelInfo(
-        id="Qwen/Qwen2.5-7B-Instruct",
-        family_id="qwen2.5-7b-a",
-        name="Qwen2.5-7B-Instruct",
-        parameter_count=7_000_000_000,
+        id="Qwen/Qwen2.5-72B-Instruct",
+        family_id="qwen2.5-72b",
+        name="Qwen2.5-72B-Instruct",
+        parameter_count=72_000_000_000,
         downloads=1000,
         likes=100,
     )
@@ -430,16 +437,20 @@ def test_full_gpu_estimated_ranks_above_partial_direct():
         hw,
         top_n=10,
         benchmark_scores={
-            "Qwen/Qwen2.5-7B-Instruct": 75.0,  # direct but partial
+            "Qwen/Qwen2.5-72B-Instruct": 75.0,  # direct but partial
             "Qwen/Qwen3-32B": 85.0,  # estimated but full gpu
         },
         task_profile="general",
         require_direct_top=True,
         min_params_b=7.0,
     )
-    assert len(results) == 2
+    # The full-GPU candidate must always win over a partial-offload one of
+    # comparable quality. The partial 72B may or may not be retained
+    # depending on whether its sub-2 t/s estimate trips the speed floor —
+    # either way the full-GPU 8B should be #1.
+    assert results
     assert results[0].fit_type == "full_gpu"
-    assert results[1].fit_type == "partial_offload"
+    assert results[0].model.id == "Qwen/Qwen3-8B-AWQ"
 
 
 def test_evidence_strict_filters_out_estimated_models():

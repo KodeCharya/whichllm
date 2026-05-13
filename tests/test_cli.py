@@ -40,7 +40,13 @@ def _hw_with_gpu(vram_gb: int) -> HardwareInfo:
 
 
 def test_auto_min_params_general_by_vram():
-    assert _auto_min_params_for_profile(_hw_with_gpu(8), "general") == 7.0
+    # Updated thresholds: tiny GPUs (4-8GB) get a lower floor so they can
+    # surface full-GPU 3-4B models instead of being forced into 7B+
+    # partial-offload-only candidates.
+    assert _auto_min_params_for_profile(_hw_with_gpu(4), "general") == 2.0
+    assert _auto_min_params_for_profile(_hw_with_gpu(6), "general") == 3.0
+    assert _auto_min_params_for_profile(_hw_with_gpu(8), "general") == 5.0
+    assert _auto_min_params_for_profile(_hw_with_gpu(12), "general") == 8.0
     assert _auto_min_params_for_profile(_hw_with_gpu(24), "general") == 10.0
     assert _auto_min_params_for_profile(_hw_with_gpu(32), "general") == 12.0
 
@@ -89,7 +95,11 @@ def test_version_option_prints_version_and_exits():
     assert _current_version() in result.stdout
 
 
-def test_merge_model_eval_benchmarks_injects_only_missing_ids():
+def test_merge_model_eval_benchmarks_is_now_a_noop():
+    """As of the self_reported evidence tier, _merge_model_eval_benchmarks
+    must NOT mutate the leaderboard scores. Uploader-reported hf_eval values
+    are consumed directly by the ranker as a separate, low-trust source.
+    """
     model_direct_missing = ModelInfo(
         id="meta-llama/Llama-3.1-8B-Instruct",
         family_id="llama-3.1-8b",
@@ -108,13 +118,18 @@ def test_merge_model_eval_benchmarks_injects_only_missing_ids():
         likes=1,
         benchmark_scores={"hf_eval": 70.0},
     )
+    original = {"Qwen/Qwen2.5-7B-Instruct": 71.2}
     merged, injected = _merge_model_eval_benchmarks(
         [model_direct_missing, model_already_present],
-        {"Qwen/Qwen2.5-7B-Instruct": 71.2},
+        original,
     )
-    assert injected == 1
-    assert merged["meta-llama/Llama-3.1-8B-Instruct"] == 66.4
-    assert merged["Qwen/Qwen2.5-7B-Instruct"] == 71.2
+    # Function is a deprecation no-op now.
+    assert injected == 0
+    assert merged is original or merged == original
+    # Critically, the uploader-reported value MUST NOT have been injected
+    # under the model id, because doing so would make it appear as a
+    # direct leaderboard hit.
+    assert "meta-llama/Llama-3.1-8B-Instruct" not in merged
 
 
 def test_validate_evidence_accepts_all_modes():
