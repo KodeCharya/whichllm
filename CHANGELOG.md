@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.5.3] - 2026-05-16
+## [0.5.3] - 2026-05-17
 
 ### Added
 
@@ -12,11 +12,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   systems are no longer always treated as CPU-only.
 - NVIDIA `nvidia-smi` fallback detection when pynvml is missing, NVML init
   fails, or NVML reports no devices.
+- Apple-prefixed Apple Silicon simulator aliases, so `--gpu "Apple M3 Max"`
+  resolves the same way as `--gpu "M3 Max"`.
 
 ### Fixed
 
 - `whichllm run` transformers chat generation now passes tokenizer mappings
   into `model.generate(**inputs)`, fixing the `KeyError: 'shape'` crash path.
+- RTX 5060 Ti bandwidth lookup now reports 448 GB/s instead of `N/A`.
 
 ### Changed
 
