@@ -18,6 +18,21 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_HF_ENDPOINT = "https://huggingface.co"
 _GGUF_SPLIT_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
+_MODEL_EXPAND_FIELDS = [
+    "config",
+    "safetensors",
+    "gguf",
+    "cardData",
+    "siblings",
+    "evalResults",
+]
+_MODEL_DETAIL_EXPAND_FIELDS = [
+    *_MODEL_EXPAND_FIELDS,
+    "downloads",
+    "likes",
+    "createdAt",
+    "lastModified",
+]
 _GENERAL_EVAL_KEYWORDS = (
     "mmlu",
     "gpqa",
@@ -29,6 +44,76 @@ _GENERAL_EVAL_KEYWORDS = (
     "truthfulqa",
     "ceval",
     "cmmlu",
+)
+
+_FRONTIER_MODEL_IDS = (
+    # Newest releases that lead 2026-Q2 benchmarks
+    "moonshotai/Kimi-K2-Thinking",
+    "moonshotai/Kimi-K2-Instruct",
+    "moonshotai/Kimi-K2-Instruct-0905",
+    "XiaomiMiMo/MiMo-V2.5-Pro",
+    "XiaomiMiMo/MiMo-V2.5",
+    "XiaomiMiMo/MiMo-V2-Flash",
+    "deepseek-ai/DeepSeek-V4-Pro",
+    "deepseek-ai/DeepSeek-V4-Flash",
+    "deepseek-ai/DeepSeek-V3.2",
+    "deepseek-ai/DeepSeek-V3.2-Exp",
+    "deepseek-ai/DeepSeek-V3.1",
+    "deepseek-ai/DeepSeek-R1-0528",
+    "zai-org/GLM-5.1",
+    "zai-org/GLM-5",
+    "zai-org/GLM-5-FP8",
+    "zai-org/GLM-5.1-FP8",
+    "zai-org/GLM-4.7-Flash",
+    "zai-org/GLM-4.6",
+    "zai-org/GLM-4.5",
+    "zai-org/GLM-4.5-Air",
+    # Open-weight mid-size frontier
+    "Qwen/Qwen3.6-27B",
+    "Qwen/Qwen3-32B",
+    "Qwen/Qwen3-14B",
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    "Qwen/Qwen3-Next-80B-A3B-Instruct",
+    "Qwen/Qwen3-235B-A22B",
+    "Qwen/Qwen3-4B-Instruct-2507",
+    # Reasoning/thinking lines that don't auto-surface via cardinality
+    "Qwen/QwQ-32B",
+    "Qwen/Qwen3-4B-Thinking-2507",
+    "deepseek-ai/DeepSeek-R1",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+    "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    # Other current open releases
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "google/gemma-3-27b-it",
+    "google/gemma-3-12b-it",
+    "google/gemma-4-31B-it",
+    "google/gemma-4-26B-A4B-it",
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+    "microsoft/phi-4",
+    "microsoft/Phi-4-mini-instruct",
+    "mistralai/Mistral-Large-Instruct-2411",
+    "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
+    "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+    "mistralai/Devstral-Small-2505",
+    "mistralai/Codestral-22B-v0.1",
+    "MiniMaxAI/MiniMax-M2",
+    "MiniMaxAI/MiniMax-M2.5",
+    # IBM Granite latest open releases
+    "ibm-granite/granite-4.0-h-small",
+    "ibm-granite/granite-4.0-h-tiny",
+    "ibm-granite/granite-3.3-8b-instruct",
+    "ibm-granite/granite-3.3-2b-instruct",
+    # AllenAI Olmo-3
+    "allenai/Olmo-3-7B-Instruct",
+    "allenai/Olmo-3-1025-7B",
+    # Nemotron 3 series
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
 )
 
 
@@ -711,6 +796,99 @@ def _parse_model(data: dict) -> ModelInfo | None:
     )
 
 
+def _model_list_params(
+    *,
+    pipeline_tag: str = "text-generation",
+    sort: str = "downloads",
+    limit: int,
+    filter_value: str | None = None,
+) -> dict[str, object]:
+    """Build HF model-list query params with consistent metadata expansion."""
+    params: dict[str, object] = {
+        "pipeline_tag": pipeline_tag,
+        "sort": sort,
+        "limit": str(limit),
+        "expand[]": _MODEL_EXPAND_FIELDS,
+    }
+    if filter_value:
+        params["filter"] = filter_value
+    return params
+
+
+async def _fetch_model_list(
+    client: httpx.AsyncClient,
+    *,
+    label: str,
+    params: dict[str, object],
+    optional: bool = False,
+) -> list[dict]:
+    """Fetch a HF list endpoint and return its JSON payload.
+
+    Optional queries improve freshness but should not break the entire CLI when
+    HuggingFace changes a sort/filter combination.
+    """
+    logger.debug("Fetching %s models from HF API", label)
+    try:
+        response = await get_with_retries(client, _hf_api_url("models"), params=params)
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        if optional:
+            logger.debug("%s fetch skipped: %s", label, exc)
+            return []
+        raise
+
+    if not isinstance(payload, list):
+        if optional:
+            logger.debug("%s fetch skipped: expected list payload", label)
+            return []
+        raise ValueError(f"Expected list payload for {label} model fetch")
+    return payload
+
+
+def _append_parsed_models(
+    models: list[ModelInfo],
+    seen_ids: set[str],
+    data_list: list[dict],
+) -> None:
+    """Parse and append unseen model records in-place."""
+    for data in data_list:
+        model_id = data.get("id")
+        if not isinstance(model_id, str) or model_id in seen_ids:
+            continue
+        model = _parse_model(data)
+        if model:
+            models.append(model)
+            seen_ids.add(model.id)
+
+
+async def _fetch_frontier_model(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    model_id: str,
+) -> dict | None:
+    """Fetch one pinned frontier model, returning None on soft failure."""
+    async with semaphore:
+        try:
+            response = await get_with_retries(
+                client,
+                _hf_api_url(f"models/{model_id}"),
+                params={"expand[]": _MODEL_DETAIL_EXPAND_FIELDS},
+            )
+            if response.status_code >= 400:
+                logger.debug(
+                    "Frontier fetch skipped %s: HTTP %s",
+                    model_id,
+                    response.status_code,
+                )
+                return None
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.debug("Frontier fetch failed for %s: %s", model_id, exc)
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
 async def fetch_models(
     limit: int = 300, include_vision: bool = True
 ) -> list[ModelInfo]:
@@ -722,268 +900,84 @@ async def fetch_models(
         follow_redirects=True,
         headers={"Accept-Encoding": DEFAULT_ACCEPT_ENCODING},
     ) as client:
-        # Fetch top text-generation models
-        params = {
-            "pipeline_tag": "text-generation",
-            "sort": "downloads",
-            "limit": str(limit),
-            "expand[]": [
-                "config",
-                "safetensors",
-                "gguf",
-                "cardData",
-                "siblings",
-                "evalResults",
-            ],
-        }
-        logger.debug(f"Fetching models from HF API (limit={limit})")
-        resp = await get_with_retries(client, _hf_api_url("models"), params=params)
-        resp.raise_for_status()
-        data_list = resp.json()
-        for data in data_list:
-            model = _parse_model(data)
-            if model:
-                models.append(model)
-
-        # Also fetch GGUF-specific models
-        gguf_params = {
-            "pipeline_tag": "text-generation",
-            "filter": "gguf",
-            "sort": "downloads",
-            "limit": str(limit),
-            "expand[]": [
-                "config",
-                "safetensors",
-                "gguf",
-                "cardData",
-                "siblings",
-                "evalResults",
-            ],
-        }
-        logger.debug("Fetching GGUF models from HF API")
-        resp = await get_with_retries(client, _hf_api_url("models"), params=gguf_params)
-        resp.raise_for_status()
-        gguf_data_list = resp.json()
-
-        seen_ids = {m.id for m in models}
-        for data in gguf_data_list:
-            if data.get("id") not in seen_ids:
-                model = _parse_model(data)
-                if model:
-                    models.append(model)
-                    seen_ids.add(model.id)
-
-        # Fetch recently updated GGUF models (catch new releases)
-        recent_params = {
-            "pipeline_tag": "text-generation",
-            "filter": "gguf",
-            "sort": "lastModified",
-            "limit": str(limit),
-            "expand[]": [
-                "config",
-                "safetensors",
-                "gguf",
-                "cardData",
-                "siblings",
-                "evalResults",
-            ],
-        }
-        logger.debug("Fetching recent GGUF models from HF API")
-        resp = await get_with_retries(
-            client, _hf_api_url("models"), params=recent_params
-        )
-        resp.raise_for_status()
-        recent_data_list = resp.json()
-
-        for data in recent_data_list:
-            if data.get("id") not in seen_ids:
-                model = _parse_model(data)
-                if model:
-                    models.append(model)
-                    seen_ids.add(model.id)
-
-        # Trending (downloads accumulate slowly; trending surfaces what is
-        # *currently* generating interest — Qwen3.6, DeepSeek V4, GLM-5, etc.
-        # — which the downloads sort takes weeks to reflect).
-        for filter_value in (None, "gguf"):
-            trending_params = {
-                "pipeline_tag": "text-generation",
-                "sort": "trending",
-                "limit": str(limit),
-                "expand[]": [
-                    "config",
-                    "safetensors",
-                    "gguf",
-                    "cardData",
-                    "siblings",
-                    "evalResults",
-                ],
-            }
-            if filter_value:
-                trending_params["filter"] = filter_value
-            logger.debug(
-                f"Fetching trending {filter_value or 'all'} models from HF API"
-            )
-            try:
-                resp = await get_with_retries(
-                    client, _hf_api_url("models"), params=trending_params
-                )
-                resp.raise_for_status()
-                trending_data_list = resp.json()
-            except (httpx.HTTPError, ValueError) as e:
-                # Trending is a soft addition — if HF rejects the sort key
-                # (or returns malformed JSON) just skip without aborting the
-                # whole fetch.
-                logger.debug(f"Trending fetch skipped: {e}")
-                continue
-
-            for data in trending_data_list:
-                if data.get("id") not in seen_ids:
-                    model = _parse_model(data)
-                    if model:
-                        models.append(model)
-                        seen_ids.add(model.id)
-
-        # Explicit fetch for frontier / hard-to-find models. The sort-based
-        # queries above can miss models that are very new (no download count
-        # yet) or that publish weights only to a low-traffic mirror — yet
-        # those are exactly the models a user needs to evaluate before
-        # buying hardware. Pull them by ID one at a time; failures are
-        # absorbed silently.
-        _FRONTIER_MODEL_IDS = (
-            # Newest releases that lead 2026-Q2 benchmarks
-            "moonshotai/Kimi-K2-Thinking",
-            "moonshotai/Kimi-K2-Instruct",
-            "moonshotai/Kimi-K2-Instruct-0905",
-            "XiaomiMiMo/MiMo-V2.5-Pro",
-            "XiaomiMiMo/MiMo-V2.5",
-            "XiaomiMiMo/MiMo-V2-Flash",
-            "deepseek-ai/DeepSeek-V4-Pro",
-            "deepseek-ai/DeepSeek-V4-Flash",
-            "deepseek-ai/DeepSeek-V3.2",
-            "deepseek-ai/DeepSeek-V3.2-Exp",
-            "deepseek-ai/DeepSeek-V3.1",
-            "deepseek-ai/DeepSeek-R1-0528",
-            "zai-org/GLM-5.1",
-            "zai-org/GLM-5",
-            "zai-org/GLM-5-FP8",
-            "zai-org/GLM-5.1-FP8",
-            "zai-org/GLM-4.7-Flash",
-            "zai-org/GLM-4.6",
-            "zai-org/GLM-4.5",
-            "zai-org/GLM-4.5-Air",
-            # Open-weight mid-size frontier
-            "Qwen/Qwen3.6-27B",
-            "Qwen/Qwen3-32B",
-            "Qwen/Qwen3-14B",
-            "Qwen/Qwen3-8B",
-            "Qwen/Qwen3-Coder-30B-A3B-Instruct",
-            "Qwen/Qwen3-Next-80B-A3B-Instruct",
-            "Qwen/Qwen3-235B-A22B",
-            "Qwen/Qwen3-4B-Instruct-2507",
-            # Reasoning/thinking lines that don't auto-surface via cardinality
-            "Qwen/QwQ-32B",
-            "Qwen/Qwen3-4B-Thinking-2507",
-            "deepseek-ai/DeepSeek-R1",
-            "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
-            "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
-            "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
-            # Other current open releases
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-            "google/gemma-3-27b-it",
-            "google/gemma-3-12b-it",
-            "google/gemma-4-31B-it",
-            "google/gemma-4-26B-A4B-it",
-            "meta-llama/Llama-3.3-70B-Instruct",
-            "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
-            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            "microsoft/phi-4",
-            "microsoft/Phi-4-mini-instruct",
-            "mistralai/Mistral-Large-Instruct-2411",
-            "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
-            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
-            "mistralai/Devstral-Small-2505",
-            "mistralai/Codestral-22B-v0.1",
-            "MiniMaxAI/MiniMax-M2",
-            "MiniMaxAI/MiniMax-M2.5",
-            # IBM Granite latest open releases
-            "ibm-granite/granite-4.0-h-small",
-            "ibm-granite/granite-4.0-h-tiny",
-            "ibm-granite/granite-3.3-8b-instruct",
-            "ibm-granite/granite-3.3-2b-instruct",
-            # AllenAI Olmo-3 (the only Olmo-3 line that shipped publicly)
-            "allenai/Olmo-3-7B-Instruct",
-            "allenai/Olmo-3-1025-7B",
-            # Nemotron 3 series
-            "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
-            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-        )
-        for model_id in _FRONTIER_MODEL_IDS:
-            if model_id in seen_ids:
-                continue
-            try:
-                resp = await get_with_retries(
-                    client,
-                    _hf_api_url(f"models/{model_id}"),
-                    params={
-                        "expand[]": [
-                            "config",
-                            "safetensors",
-                            "gguf",
-                            "cardData",
-                            "siblings",
-                            "evalResults",
-                            "downloads",
-                            "likes",
-                            "createdAt",
-                            "lastModified",
-                        ],
-                    },
-                )
-                if resp.status_code >= 400:
-                    logger.debug(
-                        f"Frontier fetch skipped {model_id}: HTTP {resp.status_code}"
-                    )
-                    continue
-                data = resp.json()
-            except (httpx.HTTPError, ValueError) as e:
-                logger.debug(f"Frontier fetch failed for {model_id}: {e}")
-                continue
-            model = _parse_model(data)
-            if model:
-                models.append(model)
-                seen_ids.add(model.id)
-
+        required_queries = [
+            (
+                "download-ranked text-generation",
+                _model_list_params(limit=limit),
+            ),
+            (
+                "download-ranked GGUF",
+                _model_list_params(limit=limit, filter_value="gguf"),
+            ),
+            (
+                "recent GGUF",
+                _model_list_params(
+                    limit=limit,
+                    filter_value="gguf",
+                    sort="lastModified",
+                ),
+            ),
+        ]
         if include_vision:
-            # 画像入力系は用途が異なるため、明示的に有効化されたときだけ取得する。
-            for pipeline_tag in ("image-text-to-text",):
-                mm_params = {
-                    "pipeline_tag": pipeline_tag,
-                    "sort": "downloads",
-                    "limit": str(limit),
-                    "expand[]": [
-                        "config",
-                        "safetensors",
-                        "gguf",
-                        "cardData",
-                        "siblings",
-                        "evalResults",
-                    ],
-                }
-                logger.debug(f"Fetching {pipeline_tag} models from HF API")
-                resp = await get_with_retries(
-                    client, _hf_api_url("models"), params=mm_params
+            required_queries.append(
+                (
+                    "image-text-to-text",
+                    _model_list_params(
+                        pipeline_tag="image-text-to-text",
+                        limit=limit,
+                    ),
                 )
-                resp.raise_for_status()
-                mm_data_list = resp.json()
+            )
 
-                for data in mm_data_list:
-                    if data.get("id") not in seen_ids:
-                        model = _parse_model(data)
-                        if model:
-                            models.append(model)
-                            seen_ids.add(model.id)
+        required_payloads = await asyncio.gather(
+            *(
+                _fetch_model_list(client, label=label, params=params)
+                for label, params in required_queries
+            )
+        )
+
+        seen_ids: set[str] = set()
+        for payload in required_payloads:
+            _append_parsed_models(models, seen_ids, payload)
+
+        # Downloads accumulate slowly; trending catches models currently
+        # gaining attention before the downloads sort reflects them.
+        trending_payloads = await asyncio.gather(
+            *(
+                _fetch_model_list(
+                    client,
+                    label=f"trending {filter_value or 'all'}",
+                    params=_model_list_params(
+                        limit=limit,
+                        sort="trending",
+                        filter_value=filter_value,
+                    ),
+                    optional=True,
+                )
+                for filter_value in (None, "gguf")
+            )
+        )
+        for payload in trending_payloads:
+            _append_parsed_models(models, seen_ids, payload)
+
+        # Sort-based queries can miss new or low-traffic frontier releases.
+        # Fetch pinned IDs concurrently but bound fan-out to avoid excessive
+        # simultaneous requests against the Hub.
+        frontier_ids = [
+            model_id for model_id in _FRONTIER_MODEL_IDS if model_id not in seen_ids
+        ]
+        frontier_semaphore = asyncio.Semaphore(8)
+        frontier_payloads = await asyncio.gather(
+            *(
+                _fetch_frontier_model(client, frontier_semaphore, model_id)
+                for model_id in frontier_ids
+            )
+        )
+        _append_parsed_models(
+            models,
+            seen_ids,
+            [payload for payload in frontier_payloads if payload is not None],
+        )
 
     logger.debug(f"Fetched {len(models)} models total")
     return models

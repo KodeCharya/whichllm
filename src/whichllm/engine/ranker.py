@@ -653,7 +653,7 @@ def rank_models(
     fit_filter: str = "any",
 ) -> list[CompatibilityResult]:
     """Rank models by quality for the given hardware. Returns top N results."""
-    results: list[CompatibilityResult] = []
+    results_by_family: dict[str, CompatibilityResult] = {}
     gguf_only_backend = _is_gguf_only_backend(hardware)
 
     # Pre-compute max downloads/likes per family so GGUF converters
@@ -673,9 +673,6 @@ def rank_models(
         if m.parameter_count and m.downloads >= family_dominant_downloads.get(fid, -1):
             family_dominant_downloads[fid] = m.downloads
             family_dominant_params[fid] = m.parameter_count
-
-    # Deduplicate by family: pick best variant per family
-    seen_families: set[str] = set()
 
     # Sort models by downloads (popular first) to process best candidates first
     sorted_models = sorted(models, key=lambda m: m.downloads, reverse=True)
@@ -832,33 +829,24 @@ def rank_models(
         if best_for_model is None:
             continue
 
-        # Deduplicate by family: keep the one with highest quality score
         family_key = model.family_id
-        if family_key in seen_families:
-            # Check if this is better than existing
-            existing = next(
-                (r for r in results if r.model.family_id == family_key), None
-            )
-            if existing and _family_selection_key(
+        existing = results_by_family.get(family_key)
+        if existing is not None:
+            if _family_selection_key(
                 best_for_model,
                 require_direct_top,
             ) > _family_selection_key(existing, require_direct_top):
-                results.remove(existing)
-                results.append(best_for_model)
+                results_by_family[family_key] = best_for_model
             continue
 
-        seen_families.add(family_key)
-        results.append(best_for_model)
+        results_by_family[family_key] = best_for_model
 
-    if require_direct_top:
-        results.sort(
-            key=lambda r: _family_selection_key(r, require_direct_top),
-            reverse=True,
-        )
-    else:
-        results.sort(
-            key=lambda r: _family_selection_key(r, require_direct_top), reverse=True
-        )
+    results = list(results_by_family.values())
+
+    results.sort(
+        key=lambda r: _family_selection_key(r, require_direct_top),
+        reverse=True,
+    )
 
     # Junk floor: when at least one candidate scores ≥ 30, drop anything
     # below 20. This stops Q1_0 / Q2_0 derivatives (and other extreme-quant
